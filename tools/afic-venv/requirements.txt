@@ -1,0 +1,25 @@
+# Every Python module the Arcade Foundry repos use, for the one shared venv
+# per machine (AFIC_VENV, default ~/venvs/afic). Install with setup.sh here,
+# never into the system's Python. Standard library aside, the tools need
+# Python 3.11+ (tomllib).
+
+# x86 recompilers (common/tools/x86recomp): Lindbergh, Chihiro, ALLS
+capstone>=5.0
+pyelftools
+pefile
+
+# Mesa's build (ALLS tools/mac-graphics)
+mako
+PyYAML
+packaging
+
+# Cores-Common tests: the 7z fixtures (tests/make_fixtures.py)
+py7zr
+
+# Model 1/2 tests: the plugin's Lua (lua_*_test.py), Ghidra SLEIGH oracle
+lupa
+pypcode
+
+# App: scripts/make_icons.py
+Pillow
+numpy
