@@ -48,6 +48,16 @@ class Test(unittest.TestCase):
         with self.assertRaises(afgames.ManifestError):
             afgames.load_core(self.write(CORE + CORE))  # listed twice
 
+    def test_pc(self):
+        pc = '[[game]]\nset = "dcusans"\ntitle = "Daytona Championship USA"\nyear = 2019\nboard = "segapc"\n'
+        games = afgames.load_core(self.write(pc + 'program = "Daytona.exe"\n'))
+        self.assertEqual(games[0]["platform"], "pc")
+        self.assertEqual(games[0]["program"], "Daytona.exe")
+        self.assertEqual(afgames.load_core(self.write(CORE))[0]["program"], "")
+        self.assertEqual(afgames.load_core(self.write(pc))[0]["program"], "")
+        with self.assertRaises(afgames.ManifestError):  # only they have one
+            afgames.load_core(self.write(CORE + 'program = "x.exe"\n'))
+
     def test_app(self):
         cores = {"model12": afgames.load_core(self.write(CORE))}
         app = afgames.load_app(self.write('[[game]]\nset = "swa"\nhint = "the left stick flies"\n'), cores)

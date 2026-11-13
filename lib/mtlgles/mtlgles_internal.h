@@ -55,6 +55,9 @@ typedef struct mg_texture {
     // the sampler last made for it (owned by the context's dictionary) and its key
     id<MTLSamplerState> smp;
     struct mg_sampler_key { GLenum min_filter, mag_filter, wrap_s, wrap_t; int mip; float min_lod, max_lod; } smp_key;
+    // a copy a draw samples instead when the texture is also what it draws into
+    // (mtlgles_draw.m, feedback_copy), made on first need
+    id<MTLTexture> fb_copy;
 } mg_texture;
 
 typedef struct mg_renderbuffer {
@@ -160,6 +163,7 @@ struct mtlgles_context {
     id<MTLCommandQueue> queue;
     id<MTLCommandBuffer> cmd;         // being recorded (nil: none yet)
     id<MTLRenderCommandEncoder> enc;  // the open render pass (nil: none)
+    id<MTLTexture> feedback_src, feedback_copy;   // this draw samples the copy for the attachment
     id<MTLBlitCommandEncoder> blit;   // the open blit pass (nil: none)
     // uploads to textures the current command buffer has not used: their own
     // command buffer, committed first, so they need not end a render pass

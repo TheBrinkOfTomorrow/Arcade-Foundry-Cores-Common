@@ -34,6 +34,22 @@ PINT = {
     'addpd': ('d', 2, 'a+b'), 'subpd': ('d', 2, 'a-b'), 'mulpd': ('d', 2, 'a*b'), 'divpd': ('d', 2, 'a/b'),
     'pavgb': ('b', 16, '(uint8_t)((a+b+1)>>1)'),
     'pminsw': ('sw', 8, 'a<b?a:b'), 'pmaxsw': ('sw', 8, 'a>b?a:b'),
+    # saturating byte/word arithmetic, compares, averages (SSE2 and MMX)
+    'paddusb': ('b', 16, '(uint8_t)(a+b>255?255:a+b)'),
+    'paddusw': ('w', 8, '(uint16_t)(a+b>65535?65535:a+b)'),
+    'psubusb': ('b', 16, '(uint8_t)(a>b?a-b:0)'),
+    'psubusw': ('w', 8, '(uint16_t)(a>b?a-b:0)'),
+    # (bytes as signed through casts: a core's mmx_t has no sb field)
+    'paddsb': ('b', 16, '(uint8_t)(int8_t)((int8_t)a+(int8_t)b>127?127:(int8_t)a+(int8_t)b<-128?-128:(int8_t)a+(int8_t)b)'),
+    'psubsb': ('b', 16, '(uint8_t)(int8_t)((int8_t)a-(int8_t)b>127?127:(int8_t)a-(int8_t)b<-128?-128:(int8_t)a-(int8_t)b)'),
+    'pcmpgtb': ('b', 16, '(int8_t)a>(int8_t)b?0xffu:0u'),
+    'pcmpgtw': ('sw', 8, 'a>b?-1:0'),
+    'pavgw': ('w', 8, '(uint16_t)((a+b+1)>>1)'),
+    'pminub': ('b', 16, 'a<b?a:b'), 'pmaxub': ('b', 16, 'a>b?a:b'),
+    'minpd': ('d', 2, 'sse_mind(a,b)'), 'maxpd': ('d', 2, 'sse_maxd(a,b)'),
+    # SSE4.1
+    'pminsd': ('i', 4, 'a<b?a:b'), 'pmaxsd': ('i', 4, 'a>b?a:b'),
+    'pmulld': ('u', 4, 'a*b'),
 }
 SCALAR = {
     'addss': ('f', 'a+b'), 'subss': ('f', 'a-b'), 'mulss': ('f', 'a*b'), 'divss': ('f', 'a/b'),
@@ -465,3 +481,80 @@ class SSEGen:
 
     def g_fxsave(self, fg, ins, ops):
         return 'memset(M+%s,0,512);wr16(%s,c->fcw);wr32(%s+24u,c->mxcsr);' % (fg.addr(ins, ops[0]), fg.addr(ins, ops[0]), fg.addr(ins, ops[0]))
+
+    # ---- added for 32-bit Windows games (Daytona Championship USA) ----------
+    def g_cvtdq2pd(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%s%s.d[0]=(double)S.i[0];%s.d[1]=(double)S.i[1];' % (self.vec_of(fg, ins, ops[1], 16), D, D)
+
+    def g_cvtps2dq(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%sfor(int k=0;k<4;k++)%s.i[k]=sse_cvt32(c,S.f[k]);' % (self.vec_of(fg, ins, ops[1], 16), D)
+
+    def g_cvttpd2dq(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%s%s.i[0]=sse_cvtt32(S.d[0]);%s.i[1]=sse_cvtt32(S.d[1]);%s.q[1]=0;' % (self.vec_of(fg, ins, ops[1], 16), D, D, D)
+
+    def g_sqrtpd(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%sfor(int k=0;k<2;k++)%s.d[k]=sqrt(S.d[k]);' % (self.vec_of(fg, ins, ops[1], 16), D)
+
+    def g_shufpd(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        i = ops[2].imm
+        return '%sxmm_t A=%s;%s.q[0]=A.q[%d];%s.q[1]=S.q[%d];' % (self.vec_of(fg, ins, ops[1], 16), D, D, i & 1, D, (i >> 1) & 1)
+
+    def g_psadbw(self, fg, ins, ops):
+        D, w = self.dst(ins, ops[0])
+        if w == 8:
+            return '%s{uint64_t t=0;for(int k=0;k<8;k++){int v=(int)%s.b[k]-S.b[k];t+=v<0?-v:v;}%s.q=t;}' % (
+                self.vec_of(fg, ins, ops[1], 8), D, D)
+        return '%sfor(int h=0;h<2;h++){uint64_t t=0;for(int k=0;k<8;k++){int v=(int)%s.b[8*h+k]-S.b[8*h+k];t+=v<0?-v:v;}%s.q[h]=t;}' % (
+            self.vec_of(fg, ins, ops[1], 16), D, D)
+
+    def g_addsubps(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%s%s.f[0]-=S.f[0];%s.f[1]+=S.f[1];%s.f[2]-=S.f[2];%s.f[3]+=S.f[3];' % (self.vec_of(fg, ins, ops[1], 16), D, D, D, D)
+
+    def g_movsldup(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%s%s.u[0]=%s.u[1]=S.u[0];%s.u[2]=%s.u[3]=S.u[2];' % (self.vec_of(fg, ins, ops[1], 16), D, D, D, D)
+
+    def g_movshdup(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%s%s.u[0]=%s.u[1]=S.u[1];%s.u[2]=%s.u[3]=S.u[3];' % (self.vec_of(fg, ins, ops[1], 16), D, D, D, D)
+
+    def g_pabsd(self, fg, ins, ops):
+        D, w = self.dst(ins, ops[0])
+        return '%sfor(int k=0;k<%d;k++)%s.u[k]=S.i[k]<0?0u-(uint32_t)S.i[k]:(uint32_t)S.i[k];' % (
+            self.vec_of(fg, ins, ops[1], w), w // 4, D)
+
+    def g_palignr(self, fg, ins, ops):
+        # SSSE3: the destination:source pair shifted right by imm bytes
+        D, w = self.dst(ins, ops[0])
+        n = ops[2].imm & 0xff
+        return '%s{uint8_t t[%d];memset(t,0,sizeof t);memcpy(t,S.b,%d);memcpy(t+%d,%s.b,%d);memcpy(%s.b,t+%d,%d);}' % (
+            self.vec_of(fg, ins, ops[1], w), 4 * w, w, w, D, w, D, min(n, 2 * w), w)
+
+    def g_pblendvb(self, fg, ins, ops):
+        # SSE4.1: the mask is xmm0 (capstone may list it as a third operand)
+        D, _ = self.dst(ins, ops[0])
+        return '%sfor(int k=0;k<16;k++)if(c->xmm[0].b[k]&0x80)%s.b[k]=S.b[k];' % (self.vec_of(fg, ins, ops[1], 16), D)
+
+    def g_pinsrb(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%s.b[%d]=(uint8_t)%s;' % (D, ops[2].imm & 15, fg.rd(ins, ops[1], 8 if ops[1].type == X86_OP_MEM else 32))
+
+    def g_pinsrd(self, fg, ins, ops):
+        D, _ = self.dst(ins, ops[0])
+        return '%s.u[%d]=%s;' % (D, ops[2].imm & 3, fg.rd(ins, ops[1], 32))
+
+    def g_pextrd(self, fg, ins, ops):
+        S, _ = self.dst(ins, ops[1])
+        return fg.wr(ins, ops[0], '%s.u[%d]' % (S, ops[2].imm & 3), 32)
+
+    def g_pextrb(self, fg, ins, ops):
+        S, _ = self.dst(ins, ops[1])
+        if ops[0].type == X86_OP_MEM:
+            return fg.wr(ins, ops[0], '%s.b[%d]' % (S, ops[2].imm & 15), 8)
+        return fg.wr(ins, ops[0], '(uint32_t)%s.b[%d]' % (S, ops[2].imm & 15), 32)

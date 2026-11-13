@@ -43,10 +43,23 @@ BOARDS = {
     "model2b": ("model2", "Model 2B"),
     "model2c": ("model2", "Model 2C"),
     "model3": ("model3", "Model 3"),
+    "stv": ("stv", "ST-V"),
     "lindbergh": ("lindbergh", "Lindbergh"),
     "chihiro": ("chihiro", "Chihiro"),
-    "alls": ("alls", "ALLS"),
+    # The PC-based boards: one library filter, PC based (the app's #452);
+    # each game runs from its game folder in a runner process of its own.
+    "ringwide": ("pc", "RingWide"),
+    "ringedge": ("pc", "RingEdge"),
+    "ringedge2": ("pc", "RingEdge 2"),
+    "europar": ("pc", "Europa-R"),
+    "segapc": ("pc", "Sega PC"),
+    "alls": ("pc", "ALLS"),
 }
+
+# The platforms whose games are a folder of files the player points the app
+# at (never copied), run by the core's runner (afgame_<set>) in a process of
+# its own rather than loaded as a library.
+FOLDER_PLATFORMS = {"pc"}
 
 # How the game is played, which picks the controller layout and the controls
 # list on the game's page.
@@ -61,6 +74,19 @@ CONTROLS = {
     "fishing": "a fishing rod and reel (Sega Bass Fishing, Get Bass)",
 }
 
+# What kind of game it is, which tells the Game Director how a session runs
+# (racing: linked cabinets, one per device; shooter and fighting: two
+# players on one board, so streamed seats) and groups the game lists.
+CATEGORIES = {
+    "racing": "driving and riding games, linked cabinet against cabinet where the board had a link",
+    "shooter": "light-gun and turret games (two players on one board)",
+    "fighting": "fighting games and brawlers (two players on one board)",
+    "other": "everything else: Virtual-On, flight, fishing, sports",
+}
+# The category a game gets from its controls unless its games.toml says otherwise.
+CATEGORY_OF_CONTROLS = {"drive": "racing", "gun": "shooter", "turret": "shooter", "analog-gun": "shooter",
+                        "fighting": "fighting"}
+
 # A core repo's games.toml: [[game]] tables with these keys.
 CORE_KEYS = {
     "set": "MAME's set name (required)",
@@ -74,11 +100,13 @@ CORE_KEYS = {
     "gun_button": "the gun has a button besides the trigger",
     "players": "how many players can play on one machine (a second controller is player 2)",
     "link": "the core has link play",
+    "category": "one of CATEGORIES (default from controls: CATEGORY_OF_CONTROLS, else other)",
     "devices": "other sets it needs beside it (MAME device sets)",
     "other_names": "other file names that may hold this set (MAME's parent, an old dump name)",
     "renamed_from": "the app's earlier names for the set (saves and settings move once)",
     "rom_notes": "what the ROM set is (GAMES.md's ROM notes, before the controls)",
     "build": "a table of whatever this core's build needs (program paths, defines)",
+    "program": "a PC-based game (FOLDER_PLATFORMS): its program, as a path inside the game folder; the app checks a chosen folder holds it",
 }
 
 # The app's games.toml: [[game]] tables in the library's order.
@@ -132,10 +160,16 @@ def load_core(path):
              "link": False, "devices": [], "other_names": [], "renamed_from": [], "rom_notes": "", "build": {}, **g}
         if g["controls"] not in CONTROLS:
             raise ManifestError(f"{where}: controls {g['controls']!r} is not one of {', '.join(CONTROLS)}")
+        g.setdefault("category", CATEGORY_OF_CONTROLS.get(g["controls"], "other"))
+        if g["category"] not in CATEGORIES:
+            raise ManifestError(f"{where}: category {g['category']!r} is not one of {', '.join(CATEGORIES)}")
         v = g["core_version"].split(".")
         if len(v) != 3 or not all(p.isdigit() for p in v):
             raise ManifestError(f"{where}: core_version must be x.y.z")
         g["platform"], g["board_name"] = BOARDS[g["board"]]
+        if "program" in g and g["platform"] not in FOLDER_PLATFORMS:
+            raise ManifestError(f"{where}: program is only for the PC-based boards")
+        g.setdefault("program", "")
         games.append(g)
     return games
 

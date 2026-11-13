@@ -3,7 +3,7 @@
 `afgames.py` reads `games.toml`, the list of games kept once per repo:
 
 - Each core repo's `games.toml`: every ROM set the core builds, with its title,
-  year, board, version, core version, controls and link play.
+  year, board, version, core version, controls, category (racing, shooter, fighting or other) and link play.
 - The app's `games.toml`: the sets the app lists, in the library's order,
   with the words it shows (hints, GAMES.md's notes).
 

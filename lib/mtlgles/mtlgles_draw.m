@@ -782,11 +782,60 @@ static void trace_slot(mtlgles_context *c, mg_program *p, int st, int slot, int 
                att == t->mt ? ", also the pass's depth attachment" : "", c->draw_fb);
 }
 
+// A draw that samples a texture it also draws into (Primeval Hunt makes its
+// blurred copies of a scene in one 2048x2048 texture from another part of it):
+// the render pass would read the tiles it holds, not what is stored, and
+// blocks come out wrong on a tile-based GPU. The pass is ended, the texture
+// copied, the copy sampled instead, and a new pass loads where it left off.
+// Only such draws pay for it.
+static void feedback_copy(mtlgles_context *c, mg_program *p)
+{
+    c->feedback_src = c->feedback_copy = nil;
+    id<MTLTexture> att[MG_MAX_COLOR];
+    int natt = 0;
+    for (int i = 0; i < MG_MAX_COLOR; i++) {
+        int level, slice;
+        id<MTLTexture> t = mg_fb_color(c, c->draw_fb, i, &level, &slice);
+        if (t) att[natt++] = t;
+    }
+    if (!natt) return;
+    for (int st = 0; st < 2; st++)
+        for (int slot = 0; slot < p->nslot[st] && slot < MG_MAX_UNITS; slot++) {
+            int unit = p->unit[st][slot];
+            if (unit < 0 || unit >= MG_MAX_UNITS) unit = 0;
+            if (p->slot_cube[st][slot]) continue;
+            mg_texture *t = mg_get(&c->textures, c->unit_2d[unit]);
+            if (!t || !t->mt) continue;
+            for (int i = 0; i < natt; i++) {
+                if (att[i] != t->mt) continue;
+                if (!t->fb_copy || t->fb_copy.width != t->mt.width || t->fb_copy.height != t->mt.height ||
+                    t->fb_copy.pixelFormat != t->mt.pixelFormat || t->fb_copy.mipmapLevelCount != t->mt.mipmapLevelCount) {
+                    if (t->fb_copy) mg_defer(c, t->fb_copy);
+                    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t->mt.pixelFormat
+                                                                                                 width:t->mt.width
+                                                                                                height:t->mt.height
+                                                                                             mipmapped:t->mt.mipmapLevelCount > 1];
+                    d.mipmapLevelCount = t->mt.mipmapLevelCount;
+                    d.usage = MTLTextureUsageShaderRead;
+                    d.storageMode = MTLStorageModePrivate;
+                    t->fb_copy = [c->dev newTextureWithDescriptor:d];
+                }
+                if (c->pending_clear && c->pending_fb == c->draw_fb) mg_resolve_clear(c);   // the copy has it
+                mg_end_pass(c);
+                [mg_blit(c) copyFromTexture:t->mt toTexture:t->fb_copy];
+                c->feedback_src = t->mt;
+                c->feedback_copy = t->fb_copy;
+                return;
+            }
+        }
+}
+
 // everything a draw needs bound, then the vertex sources; 0: nothing to draw
 static int prepare(mtlgles_context *c, GLenum mode, int first, int count, mg_program **out)
 {
     mg_program *p = mg_prog(c, c->program);
     if (!p || !p->linked || count <= 0) return 0;
+    feedback_copy(c, p);
     begin_pass(c);
     if (c->cur_query) query_count(c);
     else query_pause(c);
@@ -844,6 +893,7 @@ static int prepare(mtlgles_context *c, GLenum mode, int first, int count, mg_pro
             int cube = p->slot_cube[st][slot];
             mg_texture *t = mg_get(&c->textures, cube ? c->unit_cube[unit] : c->unit_2d[unit]);
             id<MTLTexture> tex = t && t->mt ? t->mt : nil;
+            if (tex && tex == c->feedback_src) tex = c->feedback_copy;
             id<MTLSamplerState> smp = t && t->mt ? mg_sampler_for(c, t) : nil;
             if (t && t->mt) t->last_use = c->serial;
             if (!smp) {

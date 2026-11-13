@@ -14,6 +14,7 @@ Working notes that shouldn't ship go in a `*-DEVELOPER.md` file.
 | Document | Covers | State |
 |---|---|---|
 | [MTLGLES.md](MTLGLES.md) | mtlgles, OpenGL ES on Metal for the Lindbergh cores on Apple platforms | Mac done (opt-in); iPad comparison under way; tvOS 1.4.0 |
+| [Save states](https://github.com/TheBrinkOfTomorrow/Arcade-Foundry-Insert-Coin/blob/main/docs/design/SAVE-STATES.md) | In the app's designs: save states and resume across the app and cores; here, afcore 5.4 and `afcommon/state.h` | Interface done; cores in progress |
 | [X86RECOMP.md](X86RECOMP.md) | The static x86 recompilers: 32-bit ELF and XBE (recomp.py), 64-bit PE (recomp64.py) | Lindbergh and Chihiro in use; 64-bit in development |
 
 Each document follows the same outline as the app's: Purpose and scope,

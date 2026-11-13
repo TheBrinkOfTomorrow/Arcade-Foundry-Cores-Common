@@ -6,9 +6,14 @@ project(arcade_foundry_cores_common LANGUAGES C CXX)
 #
 #   afcore    the core interface header, include/afcore.h (INTERFACE target)
 #   afcommon  ROM set and game archives: zip (own inflate), 7z (the LZMA
-#             SDK, when AFC_LZMA_DIR has it) and tar (include/afcommon/)
+#             SDK, when AFC_LZMA_DIR has it) and tar (include/afcommon/);
+#             save states' bytes (afcommon/state.h)
 #   mtlgles   (opt-in, AFC_MTLGLES, Apple only) an OpenGL ES 3.0 subset on
 #             Metal under gl4es (lib/mtlgles)
+#   win64     the Windows layer a recomp64-translated Win64 program runs on
+#             (lib/win64; a core lists lib/win64/sources.cmake's files)
+#   win32     the same for a recomp.py-translated 32-bit Windows program
+#             (lib/win32, lib/win32/sources.cmake; the WinPC core)
 #
 # Standalone (cmake -S . -B build) it also builds and runs the tests.
 
@@ -26,7 +31,7 @@ add_library(afcore INTERFACE)
 add_library(afc::afcore ALIAS afcore)
 target_include_directories(afcore INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-add_library(afcommon STATIC src/zip.cpp src/archive.cpp src/tar.cpp)
+add_library(afcommon STATIC src/zip.cpp src/archive.cpp src/tar.cpp src/state.c)
 add_library(afc::afcommon ALIAS afcommon)
 target_include_directories(afcommon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(afcommon PUBLIC cxx_std_17)
@@ -85,7 +90,34 @@ if(AFC_TESTS)
     add_executable(af_debug_test tests/af_debug_test.c)
     target_link_libraries(af_debug_test PRIVATE afcore)
     add_test(NAME af_debug COMMAND af_debug_test)
+    add_executable(state_test tests/state_test.c)
+    target_link_libraries(state_test PRIVATE afcommon)
+    add_test(NAME state COMMAND state_test)
+    find_package(Threads REQUIRED)
+    # lib/pause, lib/win64 and lib/win32 are left out of the public release
+    # (PC-DEVELOPER.md), so the tests build them only when they are here.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lib/pause/pause.c)
+        add_executable(pause_test tests/pause_test.c lib/pause/pause.c)
+        target_include_directories(pause_test PRIVATE lib/pause)
+        target_link_libraries(pause_test PRIVATE Threads::Threads)
+        add_test(NAME pause COMMAND pause_test)
+    endif()
     # Every C file a front end includes must compile as C.
     add_library(afcommon_c_headers OBJECT tests/c_headers.c)
     target_include_directories(afcommon_c_headers PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    # The win64 layer (lib/win64) builds on its own; the cores link it into
+    # their runners and run its tests (Cores-ALLS-devel tests/run_samples.sh).
+    if(UNIX AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lib/win64/sources.cmake)
+        include(lib/win64/sources.cmake)
+        add_library(afc_win64_check STATIC ${AFC_WIN64_SOURCES})
+        target_include_directories(afc_win64_check PRIVATE ${AFC_WIN64_DIR})
+        target_compile_options(afc_win64_check PRIVATE -w -fno-strict-aliasing -fwrapv)
+        # the 32-bit layer (lib/win32); its tests are tests/win32/run_samples.py
+    endif()
+    if(UNIX AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lib/win32/sources.cmake)
+        include(lib/win32/sources.cmake)
+        add_library(afc_win32_check STATIC ${AFC_WIN32_SOURCES})
+        target_include_directories(afc_win32_check PRIVATE ${AFC_WIN32_DIR})
+        target_compile_options(afc_win32_check PRIVATE -w -fno-strict-aliasing -fwrapv)
+    endif()
 endif()

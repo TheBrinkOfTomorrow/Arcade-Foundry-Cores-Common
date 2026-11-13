@@ -19,6 +19,7 @@ SEC_UNINIT = 0x80
 SEC_EXEC = 0x20000000
 SEC_READ = 0x40000000
 SEC_WRITE = 0x80000000
+SEC_DISCARDABLE = 0x02000000
 
 
 class PEError(Exception):
@@ -435,9 +436,28 @@ class PEImage:
     def code_pointers_in_data(self):
         """RVAs of code that absolute pointers in the data sections point at
         (function pointers, vtables, TLS callbacks): every DIR64 fixup whose
-        value lands in an executable section."""
+        value lands in an executable section.
+
+        A program without a relocation directory (a fixed-base build, or a
+        memory dump with rebuilt imports) has no fixups to go by, so every
+        8-byte-aligned value in its non-executable sections that lands in code
+        is taken instead (discardable sections, such as DWARF debug info, are
+        never mapped and are skipped). A stray match only adds an entry point."""
         out = set()
         base = self.image_base
+        if not self.relocatable:
+            lo, hi = base, base + self.size_of_image
+            for s in self.sections:
+                if s.exec or s.flags & SEC_DISCARDABLE:
+                    continue
+                skip = (-s.rva) & 7
+                n = (len(s.data) - skip) // 8
+                if n <= 0:
+                    continue
+                for (v,) in struct.iter_unpack('<Q', s.data[skip:skip + 8 * n]):
+                    if lo <= v < hi and self.in_exec(v - base):
+                        out.add(v - base)
+            return out
         for r in self.relocs:
             s = self.sec_of(r)
             if s is None or s.exec:

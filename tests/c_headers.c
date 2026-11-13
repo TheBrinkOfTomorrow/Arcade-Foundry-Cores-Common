@@ -3,4 +3,5 @@
 #include "afcommon/tar_c.h"
 #include "afcommon/zip_c.h"
 #include "afcommon/filecheck.h"
+#include "afcommon/state.h"
 #include "af_debug.h"

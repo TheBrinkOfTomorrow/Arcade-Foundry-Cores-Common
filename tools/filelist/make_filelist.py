@@ -4,7 +4,7 @@ game against (afcore check_roms, include/afcommon/filecheck.h): every
 regular file's path, size and CRC-32, from a known-good copy of the game.
 
     make_filelist.py hotd4a.tar -o filelists/hotd4a.h
-    make_filelist.py ~/Games/ArcadeFoundry/Lindbergh/hotd4a -o filelists/hotd4a.h
+    make_filelist.py <your Lindbergh folder>/hotd4a -o filelists/hotd4a.h
 
 The input is the game's .tar (as the app downloads it) or its folder.
 Paths are relative to the game folder: the folder that holds `--marker`

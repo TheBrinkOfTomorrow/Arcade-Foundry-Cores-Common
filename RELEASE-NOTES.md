@@ -2,6 +2,32 @@
 
 Newest first. Each release is also on the repository's Releases page.
 
+## 1.3.0 (2026-11-12)
+
+**Arcade Foundry Cores: Common 1.3.0**
+
+The code the cores share, as shipped with Insert Coin 1.3.0.
+
+- **Save states:** afcore 5.4 adds `state_size`, `save_state` and
+  `load_state`, and `afcommon/state.h` writes and reads a state's bytes in
+  one layout for every core (a header with the set, core version and frame,
+  tagged chunks, a CRC). The plan is the app's docs/design/SAVE-STATES.md.
+- **Game categories:** games.toml has a category for each game (racing,
+  shooter, fighting, other), by default from its controls.
+- **x86 recompiler:** function starts in programs with no symbol table
+  (from the entry, init tables, unwind data, vtables and code addresses);
+  a jump table ends where its byte index table begins; a word in a pointer
+  table counts as a certain start only after real padding; a library's
+  relocations in its code are applied at its load address. The 64-bit
+  recompiler finds code pointers in data when a program has no relocations,
+  never starts a function from data inside a function its unwind data
+  describes or in the middle of an instruction, and takes overrides by
+  address.
+- **mtlgles:** setting a texture's parameters with no texture bound is
+  ignored, as OpenGL ES does, instead of failing. A draw that samples the
+  texture it draws into samples a copy, and compressed (S3TC) texture levels
+  are only given as whole blocks.
+
 ## 1.2.0 (2026-11-06)
 
 **Arcade Foundry Cores: Common 1.2.0**

@@ -66,7 +66,8 @@ extern "C" {
  * screen_surface (Apple: the screen as a GPU buffer, no copy to the CPU).
  * 5.2.0 check_roms (check a ROM set without starting the game). 5.3.0
  * options and set_option (a game's own settings that its menus don't
- * have: the Lindbergh games' region).
+ * have: the Lindbergh games' region). 5.4.0 save states: state_size,
+ * save_state and load_state (afcommon/state.h's layout).
  *
  * Each game's core has its own version (afcore_api.core_version, from
  * core_versions.h in its repo): major when its saves no longer carry over,
@@ -78,7 +79,7 @@ extern "C" {
 #define AFCORE_VERSION_PATCH(v) ((v) & 0xff)
 
 #define AFCORE_API_MAJOR 5
-#define AFCORE_API_MINOR 3
+#define AFCORE_API_MINOR 4
 #define AFCORE_API_PATCH 0
 #define AFCORE_API_VERSION AFCORE_MAKE_VERSION(AFCORE_API_MAJOR, AFCORE_API_MINOR, AFCORE_API_PATCH)
 
@@ -262,6 +263,24 @@ typedef struct afcore_api {
      * the core does not have. */
     const char *options;
     int (*set_option)(const char *name, const char *value);
+
+    /* 5.4; NULL in a core without save states (the x86 boards: their games
+     * run on host threads, so a frame's state can't be written out). Called
+     * between run_frame calls, on the thread that calls run_frame, never
+     * while a link is running or waiting.
+     *
+     * state_size: the most bytes save_state needs now. save_state writes the
+     * whole board at this frame (CPUs, memory, video, sound, the settings
+     * EEPROM and backup RAM) into buf in afcommon/state.h's layout and
+     * returns the bytes written, or 0 with the reason in err (buf too small:
+     * call state_size again). load_state puts the board back to such a
+     * frame, and the next run_frame carries on from it; it returns 0, or -1
+     * with the reason in err when the state is another set's, another core
+     * version's or damaged, and then the game is as it was. The EEPROM and
+     * backup RAM come back too: the next save writes the state's. */
+    size_t (*state_size)(afcore *core);
+    size_t (*save_state)(afcore *core, void *buf, size_t size, char *err, size_t err_size);
+    int (*load_state)(afcore *core, const void *buf, size_t size, char *err, size_t err_size);
 } afcore_api;
 
 #if defined(_WIN32)

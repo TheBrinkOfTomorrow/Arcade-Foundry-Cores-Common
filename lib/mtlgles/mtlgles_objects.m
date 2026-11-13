@@ -354,6 +354,7 @@ static void glDeleteTextures_(GLsizei n, const GLuint *names)
             if (c->unit_cube[u] == names[i]) c->unit_cube[u] = 0;
         }
         mg_defer(c, t->mt);
+        if (t->fb_copy) mg_defer(c, t->fb_copy);
         mg_del(&c->textures, names[i]);
         free(t);
     }
@@ -401,6 +402,8 @@ static int texture_storage(mtlgles_context *c, mg_texture *t, int level, int w, 
         if (t->fmt == f->fmt && level < t->levels && (lw ? lw : 1) == w && (lh ? lh : 1) == h) return 1;
     }
     if (t->mt) mg_defer(c, t->mt);
+    if (t->fb_copy) mg_defer(c, t->fb_copy);
+    t->fb_copy = nil;
     int cube = t->target == GL_TEXTURE_CUBE_MAP;
     MTLTextureDescriptor *d = cube ? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:f->fmt size:(NSUInteger)w0 mipmapped:YES]
                                    : [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f->fmt width:(NSUInteger)(w0 ? w0 : 1)
@@ -544,12 +547,31 @@ static void glCompressedTexImage2D_(GLenum target, GLint level, GLenum internal,
         mg_log("mtlgles: compressed texture 0x%x not done\n", internal);
         return mg_error(GL_INVALID_ENUM);
     }
-    if (size < ((w + 3) / 4) * ((h + 3) / 4) * f.block) return mg_error(GL_INVALID_VALUE);
+    int bw = (w + 3) / 4, bh = (h + 3) / 4, fw = w / 4, fh = h / 4;
+    // a level whose sides aren't multiples of 4 given only its whole blocks
+    // (Primeval Hunt's mipmaps, sized with w / 4 * h / 4): taken, the partial
+    // blocks at the right and bottom repeating their neighbours, as NVIDIA's
+    // driver let it be
+    int floored = size < bw * bh * f.block && fw && fh && size >= fw * fh * f.block;
+    if (size < bw * bh * f.block && !floored) return mg_error(GL_INVALID_VALUE);
     if (!t->target) t->target = cube_face(target) || target != GL_TEXTURE_2D ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
     if (!texture_storage(c, t, level, w, h, &f, internal)) return mg_error(GL_OUT_OF_MEMORY);
     mg_buffer *ub = mg_get(&c->buffers, c->bound_unpack);
     if (ub && ub->mb) data = (const uint8_t *)ub->mb.contents + (uintptr_t)data;
-    if (data) texture_upload_blocks(c, t, level, cube_face(target), 0, 0, w, h, data, f.block);
+    if (!data) return;
+    if (floored) {
+        uint8_t *full = malloc((size_t)bw * bh * f.block);
+        if (!full) return mg_error(GL_OUT_OF_MEMORY);
+        for (int y = 0; y < bh; y++)
+            for (int x = 0; x < bw; x++) {
+                int sx = x < fw ? x : fw - 1, sy = y < fh ? y : fh - 1;
+                memcpy(full + ((size_t)y * bw + x) * f.block, (const uint8_t *)data + ((size_t)sy * fw + sx) * f.block, f.block);
+            }
+        texture_upload_blocks(c, t, level, cube_face(target), 0, 0, w, h, full, f.block);
+        free(full);
+        return;
+    }
+    texture_upload_blocks(c, t, level, cube_face(target), 0, 0, w, h, data, f.block);
 }
 static void glCompressedTexSubImage2D_(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
                                        GLenum format, GLsizei size, const void *data)
@@ -593,7 +615,11 @@ static void glGetCompressedTexImage_(GLenum target, GLint level, void *dst)
 static void tex_param(mtlgles_context *c, GLenum target, GLenum p, float v)
 {
     mg_texture *t = mg_tex_bound(c, target);
-    if (!t) return mg_error(GL_INVALID_OPERATION);
+    // texture 0 is OpenGL ES's default texture, whose parameters may be set:
+    // nothing is drawn with it here, so they are let go without an error (gl4es
+    // sets a unit's sampler state at a draw whatever is bound; Hummer reads
+    // glGetError when it makes its render targets and stops on any)
+    if (!t) return;
     switch (p) {
     case GL_TEXTURE_MIN_FILTER: t->min_filter = (GLenum)v; break;
     case GL_TEXTURE_MAG_FILTER: t->mag_filter = (GLenum)v; break;

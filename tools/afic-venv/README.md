@@ -6,7 +6,7 @@ Python (Homebrew's and Debian's refuse it anyway), and no repo keeps a venv of
 its own.
 
 ```sh
-cd ~/Games/decomps/Arcade-Foundry-Insert-Coin-devel   # or any core checkout
+cd Arcade-Foundry-Insert-Coin-devel   # your app checkout, or any core checkout
 git pull && git submodule update --init --recursive
 cores/arcade-foundry-cores-common/tools/afic-venv/setup.sh   # in a core: common/tools/afic-venv/setup.sh
 ```
@@ -29,4 +29,4 @@ Who finds it:
 
 Folders that the old per-repo venvs left behind (`venv/` in a core checkout,
 `cores/arcade-foundry-cores-lindbergh/venv` in the app, the ALLS
-`~/Games/decomps/alls/venv`) are no longer used and can be deleted.
+checkout's own `venv`) are no longer used and can be deleted.

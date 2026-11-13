@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static recompiler: 32-bit x86 Linux ELF -> portable C.
+"""Static recompiler: 32-bit x86 (Linux ELF, Xbox XBE, Windows PE32) -> portable C.
 
 Every guest function becomes a C function `void F_<addr>(CPU *c)`. Guest
 registers live in C locals inside a function and are written back to the CPU
@@ -49,8 +49,72 @@ def cc_of(suffix):
     return COND.get(suffix)
 
 
+def msvc_image(img):
+    """An MSVC program without symbols: an XBE (Chihiro) or a PE32 (the
+    32-bit Windows games). Both take the same discovery and MSVC rules; an
+    ELF never does, so Lindbergh's output does not change."""
+    return getattr(img, 'is_xbe', False) or getattr(img, 'is_pe32', False)
+
+
 class Unsupported(Exception):
     pass
+
+
+def eh_frame_starts(d, addr, ranges=False):
+    """The pc_begin of every FDE in an .eh_frame at `addr` (with `ranges`:
+    (pc_begin, its length) pairs; pyelftools reads
+    an augmentation without an FDE pointer encoding, as GCC 3.x's "zPL", as an
+    error). Pointer encodings: absolute, or pc-relative, as 4 bytes."""
+    def uleb(k):
+        v = sh = 0
+        while True:
+            b = d[k]
+            k += 1
+            v |= (b & 0x7f) << sh
+            sh += 7
+            if b < 0x80:
+                return v, k
+    def ptr(k, enc):
+        v = struct.unpack_from('<I', d, k)[0]
+        if enc & 0x70 == 0x10:   # pc-relative
+            v = (v + addr + k) & 0xffffffff
+        return v, k + 4
+    cie_enc, out, k = {}, [], 0
+    while k + 4 <= len(d):
+        length = struct.unpack_from('<I', d, k)[0]
+        if length == 0:
+            break
+        start, body = k, k + 4
+        cie_ptr = struct.unpack_from('<I', d, body)[0]
+        if cie_ptr == 0:    # a CIE: its pointer encoding (absolute when not given)
+            j = body + 5
+            aug = d[j:d.index(b'\0', j)].decode('latin1')
+            j += len(aug) + 1
+            if 'eh' in aug:
+                j += 4
+            _, j = uleb(j)      # code alignment
+            _, j = uleb(j)      # data alignment (signed: only skipped)
+            j += 1              # return register
+            enc = 0
+            if aug.startswith('z'):
+                _, j = uleb(j)
+                for ch in aug[1:]:
+                    if ch == 'R':
+                        enc = d[j]
+                        j += 1
+                    elif ch == 'P':
+                        penc = d[j]
+                        _, j = ptr(j + 1, penc)
+                    elif ch == 'L':
+                        j += 1
+            cie_enc[start] = enc
+        else:               # an FDE: pc_begin, after its CIE pointer, then its length
+            cie = body - cie_ptr
+            pc, j = ptr(body + 4, cie_enc.get(cie, 0))
+            if pc:
+                out.append((pc, struct.unpack_from('<I', d, j)[0]) if ranges else pc)
+        k = body + length
+    return out
 
 
 class Image:
@@ -81,6 +145,8 @@ class Image:
                 for sym in s.iter_symbols():
                     if sym['st_info']['type'] == 'STT_FUNC' and sym['st_value'] and sym['st_shndx'] != 'SHN_UNDEF':
                         self.syms.setdefault(base + sym['st_value'], sym.name)
+        # a stripped program (2 Spicy): no .symtab, only what .dynsym exports
+        self.stripped = self.f.get_section_by_name('.symtab') is None
         # PLT: entry i (from 0) of .rel.plt sits at plt + 16*(i+1)
         plt = self.f.get_section_by_name('.plt')
         self.plt_start = base + plt['sh_addr']
@@ -96,10 +162,16 @@ class Image:
         self.copies = []       # (addr, name) for R_386_COPY
         self.copy_size = {}
         self.relocs = []       # (addr, type, symbol name or '') the loader applies to a library
+        textrel = base and any(t.entry.d_tag == 'DT_TEXTREL' for sec in self.f.iter_sections()
+                               if sec['sh_type'] == 'SHT_DYNAMIC' for t in sec.iter_tags())
+        code = {}              # a library's code with its text relocations applied (below)
         if reldyn:
             for rel in reldyn.iter_relocations():
                 t = rel['r_info_type']
                 name = dsym.get_symbol(rel['r_info_sym']).name if rel['r_info_sym'] else ''
+                if textrel and self._in_code(base + rel['r_offset']):
+                    code[base + rel['r_offset']] = (t, dsym.get_symbol(rel['r_info_sym']) if rel['r_info_sym'] else None)
+                    continue
                 if t == 5:
                     self.copies.append((base + rel['r_offset'], name))
                     self.copy_size[name] = dsym.get_symbol(rel['r_info_sym'])['st_size']
@@ -107,6 +179,8 @@ class Image:
                     # a library's relocations; the program's own GOT entries for
                     # symbols it takes the address of (Race TV: pthread_create)
                     self.relocs.append((base + rel['r_offset'], t, name))
+        if code:
+            self._apply_text_relocs(code)
         # what the dynamic linker would let other modules bind to
         self.exports = []
         for sym in dsym.iter_symbols():
@@ -139,6 +213,45 @@ class Image:
         self.ref_bias = [0] + ([base, self.pltgot] if base else [])
         self.libs = []
 
+    def _in_code(self, a):
+        return any(lo <= a < hi for lo, hi, d, n in self.exec_secs)
+
+    # A library built without -fPIC (Ghost Squad Evolution's snd_util.so) has
+    # its relocations in its code: calls and jumps to functions (R_386_PC32),
+    # and addresses (R_386_32, R_386_RELATIVE), which the dynamic linker
+    # writes at load. At its fixed base they are applied here, before the code
+    # is decoded; a call to a function it does not define goes to an import
+    # stub of its own (a PLT entry with no GOT slot).
+    def _apply_text_relocs(self, code):
+        secs = [(lo, hi, bytearray(d), n) for lo, hi, d, n in self.exec_secs]
+        stubs = {}
+        stub_base = self.base + 0x00800000
+        for a, (t, sym) in sorted(code.items()):
+            k = next(i for i, (lo, hi, d, n) in enumerate(secs) if lo <= a < hi)
+            lo, hi, d, n = secs[k]
+            v = struct.unpack_from('<I', d, a - lo)[0]
+            if sym is not None and sym['st_shndx'] != 'SHN_UNDEF':
+                s_addr = self.base + sym['st_value']
+            elif sym is not None and t == 2:
+                if sym.name not in stubs:
+                    stubs[sym.name] = stub_base + 16 * (len(stubs) + 1)
+                s_addr = stubs[sym.name]
+            elif t == 8:
+                s_addr = self.base
+            else:
+                raise Exception('%s: text relocation type %d to %s' % (self.file, t, sym.name if sym else '-'))
+            if t == 2:
+                v = (v + s_addr - a) & 0xffffffff
+            elif t in (1, 8):
+                v = (v + s_addr) & 0xffffffff
+            else:
+                raise Exception('%s: text relocation type %d' % (self.file, t))
+            struct.pack_into('<I', d, a - lo, v)
+        self.exec_secs = [(lo, hi, bytes(d), n) for lo, hi, d, n in secs]
+        for name, p in stubs.items():
+            self.imports.append((p, 0, name))
+            self.plt_by_addr[p] = name
+
     def add_library(self, lib):
         """Translate a shared library along with this program."""
         self.libs.append(lib)
@@ -167,6 +280,83 @@ class Image:
             self._lows_n = len(self.exec_secs)
         k = bisect.bisect_right(self._lows, a) - 1
         return k if k >= 0 and a < self.exec_secs[k][1] else -1
+
+    def unwind_starts(self):
+        """Function starts a stripped image still records: its entry, .init and
+        .fini, its constructors and destructors, and the start of every
+        function .eh_frame describes (GCC writes one for each function of a C++
+        program), so its functions can be found without symbols."""
+        starts = {self.entry}
+        for name in ('.init', '.fini'):
+            s = self.f.get_section_by_name(name)
+            if s:
+                starts.add(self.base + s['sh_addr'])
+        for name in ('.ctors', '.dtors', '.init_array', '.fini_array'):
+            s = self.f.get_section_by_name(name)
+            if s:
+                d = s.data()
+                for k in range(0, len(d) - 3, 4):
+                    v = struct.unpack_from('<I', d, k)[0]
+                    if v not in (0, 0xffffffff):
+                        starts.add(self.base + v)
+        eh = self.f.get_section_by_name('.eh_frame')
+        fdes = []
+        if eh:
+            fdes = sorted((self.base + a, n) for a, n in eh_frame_starts(eh.data(), eh['sh_addr'], True))
+            starts |= {a for a, n in fdes}
+        # what data seems to point at is checked against the functions known
+        # so far (Harley-Davidson's rodata has 0, 0, then a word that lands in
+        # the middle of an instruction of a constructor): not a function where
+        # it is inside one .eh_frame describes, or not where an instruction
+        # starts, decoding from the known start before it
+        fde_lo = [a for a, n in fdes]
+        known = sorted(a for a in starts if self.in_exec(a))
+        md = Cs(CS_ARCH_X86, CS_MODE_32)
+        def mid_function(v):
+            k = bisect.bisect_right(fde_lo, v) - 1
+            if k >= 0 and fdes[k][0] < v < fdes[k][0] + fdes[k][1]:
+                return True
+            k = bisect.bisect_right(known, v) - 1
+            if k < 0 or known[k] == v or v - known[k] > 0x10000:
+                return False
+            a = known[k]
+            for (addr, size, mnem, opstr) in md.disasm_lite(self.code_at(a, v - a + 16), a):
+                if addr + size > v:
+                    return addr != v    # an instruction runs over it
+            return False                # stopped before it (not code): unknown
+        # function pointers in its data (tables of C callbacks, which have no
+        # unwind entry): a word that points at a frame set-up, push ebp and
+        # soon after mov ebp, esp (GCC may schedule an instruction between
+        # them); a switch table's entries point at its cases, which don't
+        for lo, data, name in self.data_secs:
+            for k in range(0, len(data) - 3, 4):
+                v = struct.unpack_from('<I', data, k)[0]
+                if self.in_exec(v):
+                    code = self.code_at(v, 12)
+                    if code[:1] == b'\x55' and b'\x89\xe5' in code[1:] and not mid_function(v):
+                        starts.add(v)
+        # virtual functions (a leaf may have neither unwind entry nor frame):
+        # a vtable is its offset to the top (0, or small and negative), its
+        # type_info (in data; 0 without RTTI, as 2 Spicy), then its functions
+        def in_data(a):
+            return any(lo <= a < lo + len(d) for lo, d, n in self.data_secs)
+        for lo, data, name in self.data_secs:
+            w = struct.unpack_from('<%dI' % (len(data) // 4), data)
+            for k in range(len(w) - 2):
+                if (w[k] == 0 or w[k] >= 0xffff0000) and (w[k + 1] == 0 or in_data(w[k + 1])) and self.in_exec(w[k + 2]):
+                    j = k + 2
+                    while j < len(w) and (self.in_exec(w[j]) or self.plt_start <= w[j] < self.plt_end):
+                        if self.in_exec(w[j]) and not mid_function(w[j]):
+                            starts.add(w[j])
+                        j += 1
+        return {a for a in starts if self.in_exec(a)}
+
+    def code_at(self, a, n):
+        k = self._sec_index(a)
+        if k < 0:
+            return b''
+        lo, hi, data, name = self.exec_secs[k]
+        return data[a - lo:a - lo + n]
 
     def in_exec(self, a):
         return self._sec_index(a) >= 0
@@ -211,6 +401,9 @@ def regref(name):
     return None, None
 
 
+# lock-prefixed read-modify-writes made atomic for a PE32 (xadd and cmpxchg are always)
+ATOMIC_RMW = frozenset(('add', 'sub', 'adc', 'sbb', 'and', 'or', 'xor', 'inc', 'dec', 'neg', 'not'))
+
 class FuncGen:
     def __init__(self, rc, start, end, insns, entries):
         self.rc = rc
@@ -235,7 +428,7 @@ class FuncGen:
         if m.disp or not parts:
             parts.append('0x%xu' % (m.disp & 0xffffffff))
         seg = ins.reg_name(m.segment) if m.segment else None
-        if seg == 'fs' and getattr(self.rc.img, 'is_xbe', False):
+        if seg == 'fs' and msvc_image(self.rc.img):
             # the Xbox kernel's fs points at its processor control region
             parts.insert(0, 'c->fs_base')
         elif seg in ('fs', 'gs'):
@@ -259,6 +452,8 @@ class FuncGen:
             v = op.imm & ((1 << bits) - 1)
             return '(%s)0x%xu' % (UT[bits], v)
         if op.type == X86_OP_MEM:
+            if op is getattr(self, 'atomic_mem', None):
+                return 'o_'
             return 'rd%d(%s)' % (bits, self.addr(ins, op))
         raise Unsupported('operand')
 
@@ -277,6 +472,8 @@ class FuncGen:
                 return '%s=(%s&0xffffff00u)|(uint8_t)(%s);' % (loc, loc, val)
             return '%s=(%s&0xffff00ffu)|((uint32_t)(uint8_t)(%s)<<8);' % (loc, loc, val)
         if op.type == X86_OP_MEM:
+            if op is getattr(self, 'atomic_mem', None):
+                return 'n_=(%s)(%s);' % (UT[bits], val)
             return 'wr%d(%s,(%s)(%s));' % (bits, self.addr(ins, op), UT[bits], val)
         raise Unsupported('write operand')
 
@@ -291,7 +488,7 @@ class FuncGen:
     def goto(self, target):
         if self.start <= target < self.end and target in self.inset:
             self.labels.add(target)
-            if target <= self.cur and getattr(self.rc.img, 'is_xbe', False):
+            if target <= self.cur and msvc_image(self.rc.img):
                 # a loop: memory is read again on each pass, so a wait on a
                 # hardware register (plain memory polled by the runtime) ends,
                 # and the runtime may let another guest thread run here
@@ -333,22 +530,36 @@ class FuncGen:
         for e in self.entries:
             self.labels.add(e)
         out = []
-        multi = len(self.entries) > 1
+        seh = self.start in self.rc.seh_frames
+        multi = len(self.entries) > 1 or seh
         fname = 'B_%x' % self.start if multi else self.rc.fn_name(self.start)
         if multi:
             out.append('static void %s(CPU *c, uint32_t entry){' % fname)
         else:
             out.append('void %s(CPU *c){' % fname)
         out.append('uint32_t eax,ecx,edx,ebx,esp,ebp,esi,edi,DF;uint32_t CF=0,ZF=0,SF=0,OF=0,PF=0;' + LOAD)
+        if getattr(self.rc.img, 'is_pe32', False):
+            out.append('uint32_t esp0=esp;(void)esp0;')     # guest_jump: does a jump leave this frame?
         for n in self.jmpbufs:
             out.append('jmp_buf hb_%d;volatile uint32_t jbv_%d;' % (n, n))
         if multi:
             out.append('switch(entry){' + ''.join('case 0x%xu: goto L_%x;' % (e, e) for e in self.entries) + '}')
         last_fallthrough = True
+        resumes = set()
+        if getattr(self.rc.img, 'is_pe32', False):
+            for ins in self.insns:
+                if ins.address in self.entries and ins.mnemonic == 'mov' and ins.op_str.startswith('esp, dword ptr [ebp'):
+                    resumes.add(ins.address)
         for a, code in body:
             if a in self.labels:
                 out.append('L_%x:' % a)
             out.append(code)
+            if a in resumes:
+                # an __except block restores the establisher's esp: the frames
+                # below it are gone, so unless guest_resumed brought us here
+                # from the establisher's own host frame, the host stack goes
+                # back there first
+                out.append('if(c->resume_entered!=0x%xu){%s guest_resume(c,0x%xu);}c->resume_entered=0;' % (a, SAVE, a))
         # code that runs past the end continues in the next function (the
         # Intel compiler splits functions into "name" and "name." this way)
         if self.callname(self.end):
@@ -356,7 +567,14 @@ class FuncGen:
         else:
             out.append(SAVE + 'guest_unimpl(c,0x%xu,"fell off end"); return;' % self.end)
         out.append('}')
-        if multi:
+        if seh:
+            # an SEH handler may resume this frame (an __except block): its
+            # host frame is recorded, and guest_resume longjmps back here (cpu.h)
+            for e in self.entries:
+                out.append('void %s(CPU *c){resume_frame rf;resume_push(c,&rf);'
+                           'if(RESUME_SETJMP(rf.jb))guest_resumed(c);else %s(c,0x%xu);c->resume_top=rf.prev;}'
+                           % (self.rc.fn_name(e), fname, e))
+        elif multi:
             for e in self.entries:
                 out.append('void %s(CPU *c){%s(c,0x%xu);}' % (self.rc.fn_name(e), fname, e))
         return '\n'.join(out)
@@ -367,8 +585,12 @@ class FuncGen:
         prefix = None
         if mn.startswith('rep ') or mn.startswith('repe ') or mn.startswith('repne ') or mn.startswith('repz ') or mn.startswith('repnz '):
             prefix, mn = mn.split(' ', 1)
+        locked = mn.startswith('lock ')
         if mn.startswith('bnd ') or mn.startswith('lock '):
             mn = mn.split(' ', 1)[1]
+        if getattr(self.rc.img, 'is_pe32', False) and any(o.type == X86_OP_MEM for o in ops) and (
+                (locked and mn in ATOMIC_RMW) or mn == 'xchg'):
+            return self.atomic_rmw(ins, mn, ops)
         b0 = ins.bytes
         # strip prefixes for the opcode byte
         k = 0
@@ -380,6 +602,8 @@ class FuncGen:
         if mn in ('movsd', 'cmpsd') and len(ops) == 2 and ops[0].type == X86_OP_MEM and ops[1].type == X86_OP_MEM:
             mn = mn + '_str'
         h = getattr(self, 'i_' + mn.replace(' ', '_'), None)
+        if prefix is not None and not getattr(h, 'takes_rep', False):
+            prefix = None  # rep/repne on a non-string op (MSVC 'rep ret', BND jumps): no effect
         if h:
             return h(ins, ops) if prefix is None else h(ins, ops, prefix)
         if mn.startswith('j') and cc_of(mn[1:]):
@@ -411,6 +635,10 @@ class FuncGen:
         if ops[0].type == X86_OP_REG and ins.reg_name(ops[0].reg) in ('ds', 'es', 'fs', 'gs', 'ss', 'cs'):
             raise Unsupported('segment write')
         if ops[1].type == X86_OP_REG and ins.reg_name(ops[1].reg) in ('ds', 'es', 'fs', 'gs', 'ss', 'cs'):
+            if getattr(self.rc.img, 'is_pe32', False):
+                # Win32 flat selectors (WOW64 values): code asks which segment it runs in
+                sel = {'cs': 0x23, 'ds': 0x2b, 'es': 0x2b, 'ss': 0x2b, 'fs': 0x53, 'gs': 0x2b}
+                return self.wr(ins, ops[0], '%#x' % sel[ins.reg_name(ops[1].reg)], ops[0].size * 8)
             raise Unsupported('segment read')
         return self.wr(ins, ops[0], self.rd(ins, ops[1], ops[0].size * 8))
 
@@ -426,6 +654,26 @@ class FuncGen:
 
     def i_lea(self, ins, ops):
         return self.wr(ins, ops[0], self.addr(ins, ops[1]))
+
+    def atomic_rmw(self, ins, mn, ops):
+        """A PE32's guest threads are host threads: a lock-prefixed
+        read-modify-write of memory (and xchg with memory, locked always) is
+        atomic. xchg is one exchange; the rest run in a compare-exchange loop,
+        their memory operand read as o_ and written as n_."""
+        m = ops[0] if ops[0].type == X86_OP_MEM else ops[1]
+        b = m.size * 8
+        u = UT[b]
+        p = '(%s *)(M+%s)' % (u, self.addr(ins, m))
+        if mn == 'xchg':
+            r = ops[1] if m is ops[0] else ops[0]
+            return '{%s o_=__atomic_exchange_n(%s,%s,__ATOMIC_SEQ_CST);%s}' % (u, p, self.rd(ins, r), self.wr(ins, r, 'o_'))
+        self.atomic_mem = m
+        try:
+            body = getattr(self, 'i_' + mn)(ins, ops)
+        finally:
+            self.atomic_mem = None
+        return ('{%s *p_=%s;%s o_=__atomic_load_n(p_,__ATOMIC_SEQ_CST),n_;do{n_=o_;%s}'
+                'while(!__atomic_compare_exchange_n(p_,&o_,n_,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST));}' % (u, p, u, body))
 
     def i_xchg(self, ins, ops):
         t = self.t()
@@ -465,6 +713,14 @@ class FuncGen:
 
     def i_pushal(self, ins, ops):
         raise Unsupported('pushal')
+
+    i_pause = i_nop
+
+    def i_enter(self, ins, ops):
+        # enter n, 0 (nesting level 0 is all a compiler emits)
+        if (ops[1].imm & 31) != 0:
+            raise Unsupported('enter with nesting')
+        return 'esp-=4;wr32(esp,ebp);ebp=esp;esp-=%du;' % (ops[0].imm & 0xffff)
 
     def i_leave(self, ins, ops):
         return 'esp=ebp;ebp=rd32(esp);esp+=4;'
@@ -527,6 +783,10 @@ class FuncGen:
         t = self.rd(ins, op)
         refs = set(self.rc.data_refs_in(self.start, self.end)) | set(self.rc.jtables.get(ins.address, ()))
         cases = ''.join('case 0x%xu: goto L_%x;' % (a, a) for a in sorted(refs) if a in self.inset)
+        if getattr(self.rc.img, 'is_pe32', False):
+            # a jump may land in a frame further up (an SEH handler resuming an
+            # __except block): guest_jump decides
+            return '{uint32_t t=%s;switch(t){%sdefault:%s guest_jump(c,t,esp0);return;}}' % (t, cases, SAVE)
         return '{uint32_t t=%s;switch(t){%sdefault:%s guest_dispatch(c,t);return;}}' % (t, cases, SAVE)
 
     def arith(self, ins, ops, kind):
@@ -673,6 +933,16 @@ class FuncGen:
     def i_bsf(self, ins, ops): return self.bscan(ins, ops, False)
     def i_bsr(self, ins, ops): return self.bscan(ins, ops, True)
 
+    # BMI1/LZCNT (gcc emits tzcnt as rep bsf; a CPU without BMI1 runs it as bsf,
+    # which agrees whenever the source is not zero)
+    def i_tzcnt(self, ins, ops):
+        b = ops[0].size * 8
+        return '{%s v=%s;CF=v==0;uint32_t r=v?__builtin_ctz((uint32_t)v):%d;ZF=r==0;%s}' % (UT[b], self.rd(ins, ops[1]), b, self.wr(ins, ops[0], 'r'))
+
+    def i_lzcnt(self, ins, ops):
+        b = ops[0].size * 8
+        return '{%s v=%s;CF=v==0;uint32_t r=v?__builtin_clz((uint32_t)v)-%d:%d;ZF=r==0;%s}' % (UT[b], self.rd(ins, ops[1]), 32 - b, b, self.wr(ins, ops[0], 'r'))
+
     def rotc(self, ins, ops, left):
         b = ops[0].size * 8
         u = UT[b]
@@ -754,7 +1024,20 @@ class FuncGen:
             return '{int64_t r=(int64_t)(int32_t)%s*(int64_t)(int32_t)%s;CF=OF=r!=(int64_t)(int32_t)r;%s}' % (x, y, self.wr(ins, ops[0], '(uint32_t)r'))
         return '{int32_t r=(int32_t)(int16_t)%s*(int32_t)(int16_t)%s;CF=OF=r!=(int32_t)(int16_t)r;%s}' % (x, y, self.wr(ins, ops[0], '(uint32_t)r'))
 
+    def div_fault(self, code, cond):
+        """A PE32's integer division faults go to the runtime's SEH dispatcher
+        (guest_fault); other images divide as before."""
+        if not getattr(self.rc.img, 'is_pe32', False):
+            return code
+        return 'if(%s){%s guest_fault(c,0xc0000094u,0x%xu);%s}else %s' % (cond, SAVE, self.cur, LOAD, code)
+
     def i_div(self, ins, ops):
+        return self.div_fault(self.i_div_(ins, ops), '!(%s)' % self.rd(ins, ops[0]))
+
+    def i_idiv(self, ins, ops):
+        return self.div_fault(self.i_idiv_(ins, ops), '!(%s)' % self.rd(ins, ops[0]))
+
+    def i_div_(self, ins, ops):
         b = ops[0].size * 8
         s = self.rd(ins, ops[0])
         if b == 32:
@@ -763,7 +1046,7 @@ class FuncGen:
             return '{uint32_t n=((edx&0xffff)<<16)|(eax&0xffff);uint32_t d=%s;eax=(eax&0xffff0000u)|((n/d)&0xffff);edx=(edx&0xffff0000u)|((n%%d)&0xffff);}' % s
         return '{uint32_t n=eax&0xffff;uint32_t d=%s;eax=(eax&0xffff0000u)|((n/d)&0xff)|(((n%%d)&0xff)<<8);}' % s
 
-    def i_idiv(self, ins, ops):
+    def i_idiv_(self, ins, ops):
         b = ops[0].size * 8
         s = self.rd(ins, ops[0])
         if b == 32:
@@ -864,6 +1147,7 @@ class FuncGen:
     def mkstr(kind, size):
         def f(self, ins, ops, prefix=None):
             return self.strop(ins, size, prefix, kind)
+        f.takes_rep = True
         return f
 
     i_movsb = mkstr('movs', 1)
@@ -1029,6 +1313,13 @@ class Recompiler:
         self.img = img
         self.overrides = {}
         for fname in overrides:
+            # a name, or "0xaddress name" for a program without symbols (the
+            # function at that address, found by its code in a program that
+            # has them: Harley-Davidson's AM library is Race TV's)
+            parts = fname.split()
+            if len(parts) == 2 and parts[0].startswith('0x'):
+                self.overrides[int(parts[0], 16)] = parts[1]
+                continue
             a = img.func_by_name.get(fname)
             if a:
                 self.overrides[a] = fname
@@ -1038,6 +1329,8 @@ class Recompiler:
         self.md = Cs(CS_ARCH_X86, CS_MODE_32)
         self.md.detail = True
         self.entries = {}      # function start -> set of entry addresses
+        self.resumable = set()  # PE32: functions with entries only data names
+        self.seh_frames = set()  # PE32: functions whose host frame an SEH handler may resume (resume_frame)
         self.names = {}        # entry address -> C name
         # C names carry the program's name, so several programs link into one library
         self.prog = name
@@ -1052,7 +1345,7 @@ class Recompiler:
 
     def find_functions(self):
         img = self.img
-        if getattr(img, 'is_xbe', False):
+        if msvc_image(img):
             self.starts = sorted(self.disc.starts)
             self.extent = {}
             for k, a in enumerate(self.starts):
@@ -1062,6 +1355,12 @@ class Recompiler:
             return
         starts = set(a for a in img.syms if img.in_exec(a))
         starts.add(img.entry)
+        starts |= {a for a in self.overrides if img.in_exec(a)}   # by address: functions too
+        # a program without symbols: its functions are found as a library's are,
+        # from what it still records (unwind_starts) and the calls of its code
+        stripped = getattr(img, 'stripped', False)
+        if stripped:
+            starts |= img.unwind_starts()
         # a library names only what it exports: its other functions are found
         # from its initialiser, the code pointers its relocations fix up, and
         # (below) the direct calls and jumps of its code found so far (the
@@ -1076,7 +1375,7 @@ class Recompiler:
                         starts.add(v)
         md0 = Cs(CS_ARCH_X86, CS_MODE_32)
         lib_lo = min([l.base for l in img.libs], default=1 << 32)
-        work = sorted(a for a in starts if a >= lib_lo)
+        work = sorted(a for a in starts if a >= lib_lo or stripped)
         while work:
             ordered = sorted(starts)
             new = set()
@@ -1096,6 +1395,17 @@ class Recompiler:
                             if t not in starts and img.in_exec(t) and self.lib_of(t) is lib:
                                 new.add(t)
                         continue
+                    if stripped and a < lib_lo and mnem in ('push', 'mov'):
+                        # a program without symbols: a code address as an immediate is a
+                        # function pointer (_start pushes __libc_csu_init and main;
+                        # callbacks and thread entries are passed so)
+                        try:
+                            t = int(opstr.rsplit(', ', 1)[-1], 16)
+                        except ValueError:
+                            continue
+                        if t < lib_lo and t not in starts and t not in img.plt_by_addr and img.in_exec(t):
+                            new.add(t)
+                        continue
                     if mnem == 'call' or mnem == 'jmp':
                         try:
                             t = int(opstr, 16)
@@ -1103,8 +1413,8 @@ class Recompiler:
                             continue
                         if mnem == 'jmp' and a <= t < end:
                             continue
-                        if (t >= lib_lo and t != addr + size and t not in starts and t not in img.plt_by_addr
-                                and img.in_exec(t)):
+                        if ((t >= lib_lo or stripped) and t != addr + size and t not in starts
+                                and t not in img.plt_by_addr and img.in_exec(t)):
                             new.add(t)
             starts |= new
             work = sorted(new)
@@ -1135,10 +1445,13 @@ class Recompiler:
         %ebx holding the GOT, then jmp reg. Entries are GOT-relative."""
         self.jtables = {}      # jmp address -> targets
         ranges = []
-        if getattr(self.img, 'is_xbe', False):
+        if msvc_image(self.img):
             from xbe import Discovery
             self.disc = Discovery(self.img)
-            self.disc.run(self.extra_starts)
+            extra = list(self.extra_starts)
+            if getattr(self.img, 'is_pe32', False):
+                extra += self.img.extra_starts()     # exports, SafeSEH handlers, TLS callbacks
+            self.disc.run(extra)
             self.jtables = dict(self.disc.jtables)
             self.jt_ranges = sorted(set(self.disc.jt_ranges))
             self.jt_lows = [r[0] for r in self.jt_ranges]
@@ -1249,7 +1562,7 @@ class Recompiler:
         lo, hi, data = self.img.sec_of(a)
         md = self.md
         out = []
-        if getattr(self.img, 'is_xbe', False):
+        if msvc_image(self.img):
             # exactly what discovery reached, each decoded where it starts: the
             # bytes between are data (jump tables), padding or strings
             for x in self.reached_in(a, end):
@@ -1264,7 +1577,7 @@ class Recompiler:
             if pos < pe:
                 # undecodable bytes (data in text): stop this function here
                 break
-        if getattr(self.img, 'is_xbe', False):
+        if msvc_image(self.img):
             # only what discovery reached: the rest is data, padding or strings
             out = [i for i in out if i.address in self.disc.reached]
         return out
@@ -1272,15 +1585,14 @@ class Recompiler:
     def scan_data_refs(self):
         refs = set()
         secs = list(self.img.data_secs)
-        if getattr(self.img, 'is_xbe', False):
+        if msvc_image(self.img):
             # MSVC puts switch tables in the code
             secs += [(lo, data, name) for lo, hi, data, name in self.img.exec_secs]
+        from xbe import words
+        in_exec = self.img.in_exec
         for lo, data, name in secs:
-            for off in range(0, len(data) - 3, 4):
-                v = struct.unpack_from('<I', data, off)[0]
-                for bias in self.img.ref_bias:
-                    if self.img.in_exec((v + bias) & 0xffffffff):
-                        refs.add((v + bias) & 0xffffffff)
+            for bias in self.img.ref_bias:
+                refs.update(u for u in ((v + bias) & 0xffffffff for v in words(data)) if in_exec(u))
         self.data_refs = sorted(refs)
 
     def data_refs_in(self, lo, hi):
@@ -1294,7 +1606,7 @@ class Recompiler:
         Calls to _setjmp3 become an inline host setjmp; longjmp becomes the
         runtime's ovr_msvc_longjmp."""
         self.msvc_setjmp = {}
-        if not getattr(self.img, 'is_xbe', False):
+        if not msvc_image(self.img):
             return
         for lo, hi, data, name in self.img.exec_secs:
             i = data.find(b'\xc7\x42\x20\x30\x32\x43\x56')
@@ -1321,12 +1633,15 @@ class Recompiler:
         # pass 1: instruction boundaries and direct branch targets only
         bounds = {}
         branches = {}
+        first = {}          # function start -> its first instruction (mnemonic, operands)
+        fs0_writers = set()  # functions that write fs:[0] (link or unlink an SEH frame)
         md0 = Cs(CS_ARCH_X86, CS_MODE_32)
-        xbe = getattr(self.img, 'is_xbe', False)
+        xbe = msvc_image(self.img)
         for a in self.starts:
             lo, hi, data = self.img.sec_of(a)
             addrs = []
             br = []
+            fs0 = False
             if xbe:
                 lite = (y for x in self.reached_in(a, self.extent[a])
                         for y in md0.disasm_lite(data[x - lo:x - lo + 16], x, 1))
@@ -1334,7 +1649,11 @@ class Recompiler:
                 lite = (x for pa, pe in self.pieces(a, self.extent[a])
                         for x in md0.disasm_lite(data[pa - lo:pe - lo], pa))
             for (addr, size, mnem, opstr) in lite:
+                if not addrs:
+                    first[a] = (mnem, opstr)
                 addrs.append(addr)
+                if mnem == 'mov' and opstr.startswith('dword ptr fs:[0],'):
+                    fs0 = True
                 # a switch whose cases lie in another function's extent:
                 # they become entries of that function
                 for t in self.jtables.get(addr, ()):
@@ -1346,6 +1665,8 @@ class Recompiler:
                         pass
             bounds[a] = set(addrs)
             branches[a] = br
+            if fs0:
+                fs0_writers.add(a)
         self.ninsns = {a: len(bounds[a]) for a in self.starts}
         # entries: function starts, plus jump/call targets that land outside
         # their own function and inside another
@@ -1362,6 +1683,38 @@ class Recompiler:
                     f = self.starts[k]
                     if t in bounds[f]:
                         self.entries[f].add(t)
+        # a PE32's addresses inside a function that only data names (the
+        # __except blocks and __finally/filter funclets in SEH scope tables):
+        # entries a handler can call, or jump to with resume_to (cpu.h)
+        self.resumable = set()
+        if getattr(self.img, 'is_pe32', False):
+            from xbe import words
+            in_exec = self.img.in_exec
+            for lo, data, name in self.img.data_secs:
+                for t in set(words(data)):
+                    if not in_exec(t):
+                        continue
+                    k = bisect.bisect_right(self.starts, t) - 1
+                    if k >= 0 and self.starts[k] < t < self.extent[self.starts[k]] and t in bounds[self.starts[k]]:
+                        self.entries[self.starts[k]].add(t)
+                        self.resumable.add(self.starts[k])
+            # functions whose frame can hold an SEH registration: they link it
+            # themselves, or call a helper that links it in the caller's frame
+            # (__SEH_prolog4 and the like, which start by pushing the handler)
+            def helper(f):
+                m, o = first.get(f, ('', ''))
+                if m != 'push':
+                    return False
+                try:
+                    return self.img.in_exec(int(o, 16))
+                except ValueError:
+                    return False
+            helpers = {f for f in fs0_writers if helper(f)}
+            self.seh_frames = (fs0_writers - helpers) | self.resumable
+            for a in self.starts:
+                if any(m == 'call' and t in helpers for m, t in branches[a]):
+                    self.seh_frames.add(a)
+            print('%d functions with SEH frames, %d with resume entries' % (len(self.seh_frames), len(self.resumable)))
         for f, es in self.entries.items():
             for e in es:
                 self.names[e] = self.F % e
@@ -1468,7 +1821,7 @@ def main():
     ap.add_argument('--per-file', type=int, default=400)
     ap.add_argument('--name', default='game', help='program name: prefixes its C names, and its table is gen_program_<name>')
     ap.add_argument('--files', type=int, help='write exactly this many gen_NNN.c files (the build lists them up front)')
-    ap.add_argument('--overrides', help='file of function names the runtime implements (ovr_<name>)')
+    ap.add_argument('--overrides', help='file of function names the runtime implements (ovr_<name>), or "0xaddress name" lines')
     ap.add_argument('--patches', help='file of "symbol+offset hexbytes" lines applied before translation; '
                     'the symbol may be an address (0x...)')
     ap.add_argument('--libs', help='file of "library base" lines: shared libraries next to the ELF, translated '
@@ -1477,7 +1830,8 @@ def main():
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from xbe import is_xbe, XbeImage
-    img = XbeImage(a.elf) if is_xbe(a.elf) else Image(a.elf)
+    from pe32 import is_pe32, PE32Image
+    img = XbeImage(a.elf) if is_xbe(a.elf) else PE32Image(a.elf) if is_pe32(a.elf) else Image(a.elf)
     if a.libs:
         for line in open(a.libs):
             line = line.split('#')[0].strip()
@@ -1509,16 +1863,16 @@ def main():
         rc.extra_starts = [int(l.split('#')[0].split()[0], 16) for l in open(a.starts) if l.split('#')[0].strip()]
     n, files = rc.run(a.out, a.per_file)
     print('%d functions, %d instructions, %d files' % (len(rc.starts), n, files))
+    if rc.unsupported:
+        print('unsupported (%d kinds, %d sites):' % (len(rc.unsupported), sum(rc.unsupported.values())))
+        for k, v in rc.unsupported.most_common(60):
+            print('  %6d %s' % (v, k))
     if a.files is not None:
         if files > a.files:
             sys.exit('recomp: %d files written but the build expects %d; raise GEN_COUNT' % (files, a.files))
         for k in range(files, a.files):
             with open(os.path.join(a.out, 'gen_%03d.c' % k), 'w') as fh:
                 fh.write('/* empty */\n')
-    if rc.unsupported:
-        print('unsupported (%d kinds, %d sites):' % (len(rc.unsupported), sum(rc.unsupported.values())))
-        for k, v in rc.unsupported.most_common(60):
-            print('  %6d %s' % (v, k))
 
 
 if __name__ == '__main__':

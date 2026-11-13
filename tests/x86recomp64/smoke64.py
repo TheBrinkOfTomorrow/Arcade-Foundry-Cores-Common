@@ -32,7 +32,9 @@ def main():
     # cmpxchg16b in the translated code: an x86-64 host needs the flag, arm64 has it
     cx16 = ["-mcx16"] if platform.machine() in ("x86_64", "AMD64") else []
     # the same program twice: relocatable, and without a relocation directory
-    # (the loader then maps it at its preferred base)
+    # (the loader then maps it at its preferred base). Without fixups the code
+    # pointers in data are found by scanning, so both must find the same functions.
+    counts = {}
     for name, ldflags in (("smoke", []), ("smoke_fixed", ["-Wl,--disable-dynamicbase,--disable-reloc-section"])):
         exe = os.path.join(work, name + ".exe")
         subprocess.run([mingw, "-O2", "-I" + HERE, "-o", exe, os.path.join(HERE, "smoke.c")] + ldflags, check=True)
@@ -42,6 +44,7 @@ def main():
         if r.returncode:
             sys.stderr.write(r.stderr)
             sys.exit("recomp64.py failed")
+        counts[name] = next((l.split()[0] for l in r.stdout.splitlines() if l.endswith("files")), None)
         bad = [l for l in r.stdout.splitlines() if l.startswith("      ")]
         if bad:
             sys.exit("untranslated instructions:\n" + "\n".join(bad))
@@ -54,6 +57,8 @@ def main():
         if r.returncode or r.stdout != EXPECTED:
             sys.stderr.write(r.stderr)
             sys.exit("%s: wrong output (exit %d):\n%s\nexpected:\n%s" % (name, r.returncode, r.stdout, EXPECTED))
+    if counts["smoke"] != counts["smoke_fixed"]:
+        sys.exit("function count differs without relocations: %s" % counts)
     print("x86recomp64 smoke: ok")
 
 
